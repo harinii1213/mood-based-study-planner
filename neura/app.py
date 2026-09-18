@@ -1,191 +1,932 @@
 import os
 from functools import wraps
-from datetime import datetime, timezone
-import requests
+
 from dotenv import load_dotenv
-from flask import Flask, flash, redirect, render_template, request, session, url_for, jsonify
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from supabase import create_client, Client
 
-load_dotenv()
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
+load_dotenv(
+    dotenv_path=os.path.join(
+        os.path.dirname(__file__),
+        ".env"
+    ),
+    override=True
+)
+
+
+# ============================================================
+# FLASK APP
+# ============================================================
+
 app = Flask(__name__)
-app.secret_key = os.environ.get('NEURA_SECRET_KEY', 'change-this-in-production')
 
-SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://YOUR-PROJECT.supabase.co')
-SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', 'YOUR_SUPABASE_ANON_KEY')
-AI_API_URL = os.environ.get('AI_API_URL', 'https://YOUR-AI-PROVIDER.example/v1/chat/completions')
-AI_API_KEY = os.environ.get('AI_API_KEY', 'YOUR_AI_API_KEY')
-AI_MODEL = os.environ.get('AI_MODEL', 'YOUR_MODEL_NAME')
+app.secret_key = os.getenv(
+    "NEURA_SECRET_KEY",
+    "neura-development-secret"
+)
 
 
-def configured():
-    return SUPABASE_URL.startswith('http') and 'YOUR-PROJECT' not in SUPABASE_URL and 'YOUR_SUPABASE' not in SUPABASE_ANON_KEY
+# ============================================================
+# SUPABASE CONFIGURATION
+# ============================================================
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+if not SUPABASE_URL:
+    raise ValueError(
+        "SUPABASE_URL is missing in .env"
+    )
+
+if not SUPABASE_ANON_KEY:
+    raise ValueError(
+        "SUPABASE_ANON_KEY is missing in .env"
+    )
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY
+)
 
 
-def supabase_request(method, path, token=None, body=None, params=None):
-    headers = {'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-    r = requests.request(method, f'{SUPABASE_URL.rstrip("/")}{path}', headers=headers, json=body, params=params, timeout=15)
-    if not r.ok:
-        try: detail = r.json()
-        except Exception: detail = r.text
-        raise RuntimeError(str(detail))
-    if not r.content:
-        return None
-    return r.json()
+# ============================================================
+# LOCAL NEURA AI
+# ============================================================
+
+from ai_engine import (
+    generate_study_recommendation,
+    generate_chat_response,
+)
 
 
-def login_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not session.get('access_token'):
-            flash('Sign in to continue.', 'error')
-            return redirect(url_for('index'))
-        return view(*args, **kwargs)
-    return wrapped
+# ============================================================
+# LOGIN REQUIRED
+# ============================================================
+
+def login_required(function):
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+
+        if "user" not in session:
+
+            return jsonify({
+                "success": False,
+                "error": "Login required"
+            }), 401
+
+        return function(*args, **kwargs)
+
+    return wrapper
 
 
-def current_profile():
-    user = session.get('user', {})
-    return {'id': user.get('id'), 'name': user.get('user_metadata', {}).get('name') or user.get('email', '').split('@')[0], 'email': user.get('email', '')}
+# ============================================================
+# HOME PAGE
+# ============================================================
 
-
-@app.route('/')
+@app.get("/")
 def index():
-    if session.get('access_token'):
-        return redirect(url_for('home'))
-    return render_template('index.html')
+
+    if "user" in session:
+
+        return redirect(
+            url_for("home")
+        )
+
+    return render_template(
+        "index.html"
+    )
 
 
-@app.post('/signup')
-def signup():
-    name = request.form.get('name', '').strip()
-    email = request.form.get('signup_email', '').strip().lower()
-    password = request.form.get('signup_password', '')
-    if not name or not email or len(password) < 8:
-        flash('Enter your name, a valid email, and a password of at least 8 characters.', 'error')
-        return redirect(url_for('index'))
-    if not configured():
-        flash('Supabase is not configured yet. Add SUPABASE_URL and SUPABASE_ANON_KEY to .env first.', 'error')
-        return redirect(url_for('index'))
-    try:
-        data = supabase_request('POST', '/auth/v1/signup', body={'email': email, 'password': password, 'data': {'name': name}})
-        if not data.get('access_token'):
-            flash('Account created. Check your email if email confirmation is enabled in Supabase.', 'success')
-            return redirect(url_for('index'))
-        session.clear(); session['access_token'] = data['access_token']; session['user'] = data['user']
-        return redirect(url_for('home'))
-    except Exception as e:
-        flash('Could not create the account: ' + str(e), 'error')
-        return redirect(url_for('index'))
+# ============================================================
+# DASHBOARD
+# ============================================================
 
-
-@app.post('/login')
-def login():
-    email = request.form.get('email', '').strip().lower(); password = request.form.get('password', '')
-    if not email or not password:
-        flash('Enter your email and password.', 'error'); return redirect(url_for('index'))
-    if not configured():
-        flash('Supabase is not configured yet. Add the environment values in .env.', 'error'); return redirect(url_for('index'))
-    try:
-        data = supabase_request('POST', '/auth/v1/token', body={'email': email, 'password': password}, params={'grant_type': 'password'})
-        session.clear(); session['access_token'] = data['access_token']; session['refresh_token'] = data.get('refresh_token'); session['user'] = data['user']
-        return redirect(url_for('home'))
-    except Exception as e:
-        flash('Sign in failed. Check your email and password.', 'error'); return redirect(url_for('index'))
-
-
-@app.route('/home')
+@app.get("/home")
 @login_required
 def home():
-    return render_template('home.html', user=current_profile(), supabase_ready=configured())
+
+    return render_template(
+        "home.html"
+    )
 
 
-@app.get('/api/state')
-@login_required
-def state():
-    token = session['access_token']; uid = session['user']['id']
+# ============================================================
+# SIGNUP
+# ============================================================
+
+@app.post("/api/signup")
+def signup():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    email = (
+        data.get("email") or ""
+    ).strip()
+
+    password = (
+        data.get("password") or ""
+    )
+
+    if not email or not password:
+
+        return jsonify({
+            "success": False,
+            "error": "Email and password are required"
+        }), 400
+
     try:
-        moods = supabase_request('GET', '/rest/v1/mood_entries', token, params={'select':'*','user_id':f'eq.{uid}','order':'created_at.desc','limit':'30'}) or []
-        tasks = supabase_request('GET', '/rest/v1/tasks', token, params={'select':'*','user_id':f'eq.{uid}','order':'created_at.desc','limit':'100'}) or []
-        sessions_data = supabase_request('GET', '/rest/v1/focus_sessions', token, params={'select':'*','user_id':f'eq.{uid}','order':'started_at.desc','limit':'50'}) or []
-        return jsonify({'moods': moods, 'tasks': tasks, 'sessions': sessions_data})
+
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": password
+        })
+
+        if response.user:
+
+            session["user"] = {
+                "id": response.user.id,
+                "email": response.user.email
+            }
+
+        return jsonify({
+            "success": True,
+            "message": (
+                "Account created successfully. "
+                "Please check your email if confirmation is required."
+            )
+        })
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+
+        print(
+            "Signup error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
 
 
-@app.post('/api/mood')
-@login_required
-def mood():
-    payload = request.get_json(force=True); payload['user_id'] = session['user']['id']; payload['created_at'] = datetime.now(timezone.utc).isoformat()
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.post("/api/login")
+def login():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    email = (
+        data.get("email") or ""
+    ).strip()
+
+    password = (
+        data.get("password") or ""
+    )
+
+    if not email or not password:
+
+        return jsonify({
+            "success": False,
+            "error": "Email and password are required"
+        }), 400
+
     try:
-        row = supabase_request('POST', '/rest/v1/mood_entries', session['access_token'], payload, params={'select':'*'})
-        return jsonify(row[0] if isinstance(row, list) else row)
-    except Exception as e: return jsonify({'error': str(e)}), 500
+
+        response = (
+            supabase
+            .auth
+            .sign_in_with_password({
+                "email": email,
+                "password": password
+            })
+        )
+
+        if not response.user:
+
+            return jsonify({
+                "success": False,
+                "error": "Invalid login"
+            }), 401
+
+        session["user"] = {
+            "id": response.user.id,
+            "email": response.user.email
+        }
+
+        return jsonify({
+            "success": True,
+            "message": "Login successful"
+        })
+
+    except Exception as e:
+
+        print(
+            "Login error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 401
 
 
-@app.post('/api/task')
-@login_required
-def task():
-    payload = request.get_json(force=True); payload['user_id'] = session['user']['id']
+# ============================================================
+# LOGOUT
+# ============================================================
+
+@app.post("/api/logout")
+def logout():
+
     try:
-        row = supabase_request('POST', '/rest/v1/tasks', session['access_token'], payload, params={'select':'*'})
-        return jsonify(row[0] if isinstance(row, list) else row)
-    except Exception as e: return jsonify({'error': str(e)}), 500
+
+        supabase.auth.sign_out()
+
+    except Exception:
+
+        pass
+
+    session.clear()
+
+    return jsonify({
+        "success": True,
+        "message": "Logged out successfully"
+    })
 
 
-@app.patch('/api/task/<task_id>')
+# ============================================================
+# CURRENT USER
+# ============================================================
+
+@app.get("/api/me")
+@login_required
+def current_user():
+
+    user = session.get(
+        "user"
+    )
+
+    return jsonify({
+        "success": True,
+        "user": user
+    })
+
+
+# ============================================================
+# DASHBOARD STATE
+# ============================================================
+
+@app.get("/api/state")
+@login_required
+def get_state():
+
+    user_id = session["user"]["id"]
+
+    try:
+
+        mood_response = (
+            supabase
+            .table("mood_entries")
+            .select("*")
+            .eq("user_id", user_id)
+            .order(
+                "created_at",
+                desc=True
+            )
+            .limit(20)
+            .execute()
+        )
+
+        task_response = (
+            supabase
+            .table("tasks")
+            .select("*")
+            .eq("user_id", user_id)
+            .order(
+                "created_at",
+                desc=True
+            )
+            .execute()
+        )
+
+        focus_response = (
+            supabase
+            .table("focus_sessions")
+            .select("*")
+            .eq("user_id", user_id)
+            .order(
+                "created_at",
+                desc=True
+            )
+            .limit(20)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "moods": mood_response.data or [],
+            "tasks": task_response.data or [],
+            "focus_sessions": (
+                focus_response.data or []
+            )
+        })
+
+    except Exception as e:
+
+        print(
+            "State error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# SAVE MOOD
+# ============================================================
+
+@app.post("/api/mood")
+@login_required
+def save_mood():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    user_id = session["user"]["id"]
+
+    mood = (
+        data.get("mood") or ""
+    ).strip()
+
+    energy = data.get(
+        "energy",
+        50
+    )
+
+    note = (
+        data.get("note") or ""
+    ).strip()
+
+    if not mood:
+
+        return jsonify({
+            "success": False,
+            "error": "Mood is required"
+        }), 400
+
+    try:
+
+        energy = int(
+            energy
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        energy = 50
+
+    energy = max(
+        0,
+        min(100, energy)
+    )
+
+    try:
+
+        response = (
+            supabase
+            .table("mood_entries")
+            .insert({
+                "user_id": user_id,
+                "mood": mood,
+                "energy": energy,
+                "note": note
+            })
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": response.data
+        })
+
+    except Exception as e:
+
+        print(
+            "Mood error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# GET TASKS
+# ============================================================
+
+@app.get("/api/tasks")
+@login_required
+def get_tasks():
+
+    user_id = session["user"]["id"]
+
+    try:
+
+        response = (
+            supabase
+            .table("tasks")
+            .select("*")
+            .eq("user_id", user_id)
+            .order(
+                "created_at",
+                desc=True
+            )
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "tasks": response.data or []
+        })
+
+    except Exception as e:
+
+        print(
+            "Get tasks error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# CREATE TASK
+# ============================================================
+
+@app.post("/api/tasks")
+@login_required
+def create_task():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    user_id = session["user"]["id"]
+
+    title = (
+        data.get("title") or ""
+    ).strip()
+
+    priority = (
+        data.get("priority")
+        or "Normal"
+    ).strip()
+
+    if not title:
+
+        return jsonify({
+            "success": False,
+            "error": "Task title is required"
+        }), 400
+
+    try:
+
+        response = (
+            supabase
+            .table("tasks")
+            .insert({
+                "user_id": user_id,
+                "title": title,
+                "priority": priority,
+                "completed": False
+            })
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "task": (
+                response.data[0]
+                if response.data
+                else None
+            )
+        })
+
+    except Exception as e:
+
+        print(
+            "Create task error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# UPDATE TASK
+# ============================================================
+
+@app.put("/api/tasks/<task_id>")
 @login_required
 def update_task(task_id):
-    payload = request.get_json(force=True)
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    user_id = session["user"]["id"]
+
+    update_data = {}
+
+    if "title" in data:
+
+        update_data["title"] = (
+            data.get("title") or ""
+        ).strip()
+
+    if "priority" in data:
+
+        update_data["priority"] = (
+            data.get("priority")
+            or "Normal"
+        )
+
+    if "completed" in data:
+
+        update_data["completed"] = bool(
+            data.get("completed")
+        )
+
+    if not update_data:
+
+        return jsonify({
+            "success": False,
+            "error": "No task data provided"
+        }), 400
+
     try:
-        row = supabase_request('PATCH', '/rest/v1/tasks', session['access_token'], payload, params={'id':f'eq.{task_id}','user_id':f'eq.{session["user"]["id"]}','select':'*'})
-        return jsonify(row[0] if isinstance(row, list) and row else row)
-    except Exception as e: return jsonify({'error': str(e)}), 500
+
+        response = (
+            supabase
+            .table("tasks")
+            .update(update_data)
+            .eq("id", task_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "task": (
+                response.data[0]
+                if response.data
+                else None
+            )
+        })
+
+    except Exception as e:
+
+        print(
+            "Update task error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
-@app.delete('/api/task/<task_id>')
+# ============================================================
+# DELETE TASK
+# ============================================================
+
+@app.delete("/api/tasks/<task_id>")
 @login_required
 def delete_task(task_id):
+
+    user_id = session["user"]["id"]
+
     try:
-        supabase_request('DELETE', '/rest/v1/tasks', session['access_token'], params={'id':f'eq.{task_id}','user_id':f'eq.{session["user"]["id"]}'})
-        return jsonify({'ok': True})
-    except Exception as e: return jsonify({'error': str(e)}), 500
+
+        response = (
+            supabase
+            .table("tasks")
+            .delete()
+            .eq("id", task_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": response.data
+        })
+
+    except Exception as e:
+
+        print(
+            "Delete task error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
-@app.post('/api/focus')
+# ============================================================
+# SAVE FOCUS SESSION
+# ============================================================
+
+@app.post("/api/focus")
 @login_required
-def focus():
-    payload = request.get_json(force=True); payload['user_id'] = session['user']['id']; payload['started_at'] = payload.get('started_at') or datetime.now(timezone.utc).isoformat()
+def save_focus_session():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    user_id = session["user"]["id"]
+
+    duration = data.get(
+        "duration",
+        0
+    )
+
+    task = (
+        data.get("task") or ""
+    ).strip()
+
     try:
-        row = supabase_request('POST', '/rest/v1/focus_sessions', session['access_token'], payload, params={'select':'*'})
-        return jsonify(row[0] if isinstance(row, list) else row)
-    except Exception as e: return jsonify({'error': str(e)}), 500
+
+        duration = int(
+            duration
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        duration = 0
+
+    duration = max(
+        0,
+        duration
+    )
+
+    try:
+
+        response = (
+            supabase
+            .table("focus_sessions")
+            .insert({
+                "user_id": user_id,
+                "duration_minutes": duration,
+                "task": task
+            })
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": response.data
+        })
+
+    except Exception as e:
+
+        print(
+            "Focus session error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
-@app.post('/api/chat')
+# ============================================================
+# NEXT BEST ACTION — AI
+# ============================================================
+
+@app.post("/api/next-best-action")
+@login_required
+def next_best_action():
+
+    payload = request.get_json(
+        silent=True
+    ) or {}
+
+    mood_value = (
+        payload.get("mood")
+        or "Calm"
+    )
+
+    energy_value = payload.get(
+        "energy",
+        50
+    )
+
+    task_value = (
+        payload.get("task")
+        or "Review your study notes"
+    )
+
+    priority_value = (
+        payload.get("priority")
+        or "Normal"
+    )
+
+    try:
+
+        energy_value = int(
+            energy_value
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        energy_value = 50
+
+    energy_value = max(
+        0,
+        min(100, energy_value)
+    )
+
+    try:
+
+        recommendation = (
+            generate_study_recommendation(
+                mood=mood_value,
+                energy=energy_value,
+                task=task_value,
+                priority=priority_value
+            )
+        )
+
+        return jsonify({
+            "success": True,
+            "mood": mood_value,
+            "energy": energy_value,
+            "task": task_value,
+            "priority": priority_value,
+            "recommendation": recommendation
+        })
+
+    except Exception as e:
+
+        print(
+            "Next Best Action error:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# NEURA COPILOT — LOCAL QWEN AI
+# ============================================================
+
+@app.post("/api/chat")
 @login_required
 def chat():
-    message = (request.get_json(force=True).get('message') or '').strip()
-    if not message: return jsonify({'reply':'Tell me what you are working on or how you feel today.'})
-    if 'YOUR-AI-PROVIDER' in AI_API_URL or 'YOUR_AI_API_KEY' in AI_API_KEY:
-        return jsonify({'reply': 'Neura AI is ready for integration. Add AI_API_URL, AI_API_KEY and AI_MODEL to your .env. For now, I can still help you shape a study plan from your mood and goals.'})
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    message = (
+        data.get("message") or ""
+    ).strip()
+
+    if not message:
+
+        return jsonify({
+            "reply": (
+                "Tell me what you are working on "
+                "or what you would like to learn."
+            )
+        })
+
     try:
-        headers={'Authorization':f'Bearer {AI_API_KEY}','Content-Type':'application/json'}
-        body={'model':AI_MODEL,'messages':[{'role':'system','content':'You are Neura, an encouraging adaptive study and productivity copilot for students and professionals. Be concise, practical, safe, and personalize suggestions around mood, energy, workload and goals.'},{'role':'user','content':message}]}
-        r=requests.post(AI_API_URL,headers=headers,json=body,timeout=30); r.raise_for_status(); data=r.json()
-        return jsonify({'reply': data['choices'][0]['message']['content']})
-    except Exception:
-        return jsonify({'reply':'I could not reach the AI provider right now. Your planner is still available, and your saved data remains separate from the AI service.'})
+
+        reply = generate_chat_response(
+            message
+        )
+
+        return jsonify({
+            "reply": reply
+        })
+
+    except Exception as e:
+
+        print(
+            "Neura Copilot error:",
+            e
+        )
+
+        return jsonify({
+            "reply": (
+                "I'm having trouble generating a response "
+                "right now. Please try again."
+            )
+        })
 
 
-@app.post('/logout')
-def logout():
-    token=session.get('access_token')
-    if token and configured():
-        try: supabase_request('POST','/auth/v1/logout',token)
-        except Exception: pass
-    session.clear(); return redirect(url_for('index'))
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "app": "NEURA",
+        "ai": "Qwen local"
+    })
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)), debug=True)
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(error):
+
+    return jsonify({
+        "success": False,
+        "error": "Endpoint not found"
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+
+    return jsonify({
+        "success": False,
+        "error": "Internal server error"
+    }), 500
+
+
+# ============================================================
+# RUN APPLICATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.getenv(
+            "PORT",
+            5000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=True
+    )
